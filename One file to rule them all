@@ -1,0 +1,1047 @@
+# RNA-Seq Data Analysis: A Comprehensive Guide
+
+## Introduction
+
+RNA sequencing (RNA-seq) has revolutionized transcriptomics by enabling researchers to precisely measure gene expression levels across the entire transcriptome. This guide walks through a complete RNA-seq data analysis workflow, from quality control of raw reads to downstream functional analysis, with practical code examples at each step.
+
+
+## 1. Experimental Design Considerations
+
+Before beginning analysis, ensure your experiment is properly designed:
+
+- Minimum 3 biological replicates per condition (ideally 5-6)
+- Appropriate sequencing depth (10-30 million reads per sample for differential expression)
+- Accounting for batch effects in experimental design
+- Proper metadata collection for all samples
+
+## 2. Raw Data Quality Control
+
+### FastQC Analysis
+
+```bash
+# Run FastQC on all fastq files
+fastqc -t 8 *.fastq.gz -o fastqc_results/
+
+# Aggregate FastQC reports with MultiQC
+multiqc fastqc_results/ -o multiqc_report/
+```
+
+**Key metrics to evaluate:**
+
+- Per base sequence quality (Phred scores > 30 are good)
+- Per sequence quality scores
+- Sequence duplication levels
+- Overrepresented sequences
+- GC content distribution
+- Adapter content
+
+Example FastQC output interpretation:
+
+![FastQC Per Base Quality](https://placeholder-image.com/fastqc_quality.png)
+
+If the quality plot shows declining quality scores at the end of reads (common in Illumina data), trimming may be necessary.
+
+## 3. Read Trimming and Filtering
+
+### Using Trimmomatic
+
+```bash
+# For paired-end reads
+trimmomatic PE -threads 8 sample1_R1.fastq.gz sample1_R2.fastq.gz \
+  sample1_R1_trimmed_paired.fastq.gz sample1_R1_trimmed_unpaired.fastq.gz \
+  sample1_R2_trimmed_paired.fastq.gz sample1_R2_trimmed_unpaired.fastq.gz \
+  ILLUMINACLIP:TruSeq3-PE.fa:2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36
+
+# For single-end reads
+trimmomatic SE -threads 8 sample1.fastq.gz \
+  sample1_trimmed.fastq.gz \
+  ILLUMINACLIP:TruSeq3-SE.fa:2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36
+```
+
+Parameters explained:
+- `ILLUMINACLIP`: Removes adapter sequences
+- `LEADING/TRAILING`: Cuts bases below quality 3 from start/end of read
+- `SLIDINGWINDOW`: Scans in 4-base window, cuts when average quality < 15
+- `MINLEN`: Drops reads below 36 bases long
+
+### Using fastp (modern alternative)
+
+```bash
+# For paired-end reads
+fastp -i sample1_R1.fastq.gz -I sample1_R2.fastq.gz \
+  -o sample1_R1_cleaned.fastq.gz -O sample1_R2_cleaned.fastq.gz \
+  --detect_adapter_for_pe \
+  --cut_front --cut_tail \
+  --cut_window_size 4 --cut_mean_quality 20 \
+  --qualified_quality_phred 15 \
+  --length_required 36 \
+  --thread 8 \
+  --html sample1_fastp.html --json sample1_fastp.json
+```
+
+Verify improvement by running FastQC again on trimmed reads.
+
+## 4. Read Alignment to Reference Genome
+
+### Using STAR for alignment
+
+First, build the genome index:
+
+```bash
+# Build STAR index
+STAR --runMode genomeGenerate \
+  --genomeDir star_index/ \
+  --genomeFastaFiles genome.fa \
+  --sjdbGTFfile annotations.gtf \
+  --sjdbOverhang 99 \
+  --runThreadN 8
+```
+
+Then align reads to the reference:
+
+```bash
+# Align reads using STAR
+STAR --genomeDir star_index/ \
+  --readFilesIn sample1_R1_trimmed_paired.fastq.gz sample1_R2_trimmed_paired.fastq.gz \
+  --readFilesCommand zcat \
+  --outFileNamePrefix ./aligned/sample1_ \
+  --outSAMtype BAM SortedByCoordinate \
+  --outSAMunmapped Within \
+  --outSAMattributes Standard \
+  --quantMode GeneCounts \
+  --runThreadN 8
+```
+
+### Using HISAT2 (alternative aligner)
+
+Build index:
+
+```bash
+# Build HISAT2 index
+hisat2-build genome.fa hisat2_index/genome
+```
+
+Align reads:
+
+```bash
+# Align reads using HISAT2
+hisat2 -x hisat2_index/genome \
+  -1 sample1_R1_trimmed_paired.fastq.gz \
+  -2 sample1_R2_trimmed_paired.fastq.gz \
+  -S sample1.sam \
+  --rna-strandness RF \
+  --dta \
+  -p 8
+
+# Convert SAM to BAM, sort and index
+samtools view -bS sample1.sam > sample1.bam
+samtools sort -@ 8 -o sample1.sorted.bam sample1.bam
+samtools index sample1.sorted.bam
+```
+
+### Evaluating alignment quality
+
+```bash
+# Get alignment statistics
+samtools flagstat sample1.sorted.bam > sample1.flagstat
+
+# Calculate coverage
+samtools depth sample1.sorted.bam | awk '{sum+=$3} END {print "Average coverage = ",sum/NR}'
+
+# Count reads per chromosome
+samtools idxstats sample1.sorted.bam > sample1.idxstats
+```
+
+Example alignment metrics to evaluate:
+- Percentage of uniquely mapped reads (>70-80% is good)
+- Percentage of reads mapping to multiple loci (<10-15% is typical)
+- Percentage of unmapped reads (<10% is good)
+- Distribution of reads across chromosomes
+
+## 5. Quantification of Gene Expression
+
+### Using featureCounts for read counting
+
+```bash
+# Count reads that map to genes
+featureCounts -p -T 8 \
+  -a annotations.gtf \
+  -o counts/sample1_counts.txt \
+  aligned/sample1.sorted.bam
+  
+# For multiple samples at once
+featureCounts -p -T 8 \
+  -a annotations.gtf \
+  -o counts/all_samples_counts.txt \
+  aligned/sample1.sorted.bam aligned/sample2.sorted.bam aligned/sample3.sorted.bam [...]
+```
+
+Parameters explained:
+- `-p`: Indicates paired-end data
+- `-T 8`: Use 8 threads
+- `-a`: Annotation file in GTF format
+
+### Using Salmon for transcript quantification (alignment-free method)
+
+First, build the index:
+
+```bash
+# Build Salmon index
+salmon index -t transcripts.fa -i salmon_index --type quasi -k 31
+```
+
+Then quantify:
+
+```bash
+# Quantify expression with Salmon
+salmon quant -i salmon_index \
+  -l A \
+  -1 sample1_R1_trimmed_paired.fastq.gz \
+  -2 sample1_R2_trimmed_paired.fastq.gz \
+  -p 8 \
+  --validateMappings \
+  -o quant/sample1
+```
+
+Parameters explained:
+- `-l A`: Automatically determine library type
+- `-p 8`: Use 8 threads
+- `--validateMappings`: Improves accuracy of mapping
+
+## 6. Exploratory Data Analysis
+
+### R code for initial data exploration
+
+```r
+# Load required libraries
+library(DESeq2)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+library(PCAtools)
+
+# Read count data and metadata
+count_data <- read.table("counts/all_samples_counts.txt", header=TRUE, row.names=1, skip=1)
+count_data <- count_data[, 6:ncol(count_data)]  # Keep only count columns
+colnames(count_data) <- c("S1", "S2", "S3", "S4", "S5", "S6")  # Rename columns
+
+# Read in metadata
+metadata <- read.table("metadata.txt", header=TRUE, row.names=1)
+
+# Ensure count data and metadata match
+all(rownames(metadata) == colnames(count_data))  # Should return TRUE
+
+# Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = count_data,
+  colData = metadata,
+  design = ~ Condition
+)
+
+# Filter out genes with low counts
+dds <- dds[rowSums(counts(dds) >= 10) >= 3, ]
+
+# Variance stabilizing transformation for visualization
+vsd <- vst(dds, blind=FALSE)
+
+# Principal Component Analysis
+pca_data <- plotPCA(vsd, intgroup=c("Condition", "Batch"), returnData=TRUE)
+percentVar <- round(100 * attr(pca_data, "percentVar"))
+
+# PCA plot
+ggplot(pca_data, aes(x=PC1, y=PC2, color=Condition, shape=Batch)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  theme_classic() +
+  ggtitle("PCA of RNA-seq samples")
+
+# Sample-to-sample distance heatmap
+sampleDists <- dist(t(assay(vsd)))
+sampleDistMatrix <- as.matrix(sampleDists)
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+
+pheatmap(
+  sampleDistMatrix,
+  clustering_distance_rows=sampleDists,
+  clustering_distance_cols=sampleDists,
+  color=colors,
+  main="Sample-to-Sample Distance"
+)
+
+# Generate expression heatmap of top 50 most variable genes
+topVarGenes <- head(order(rowVars(assay(vsd)), decreasing=TRUE), 50)
+pheatmap(
+  assay(vsd)[topVarGenes, ],
+  scale="row", 
+  annotation_col=metadata[, c("Condition", "Batch")],
+  main="Top 50 most variable genes"
+)
+
+# MA plot for raw counts
+plotMA(dds, ylim=c(-5, 5), main="MA Plot - Raw Counts")
+```
+
+Key EDA visualizations to examine:
+- PCA plot to check for batch effects and group separation
+- Sample-to-sample correlation/distance heatmap for outlier detection  
+- Expression heatmap of top variable genes
+- MA plots to examine count distributions
+
+## 7. Differential Expression Analysis
+
+### Using DESeq2 for differential expression
+
+```r
+# Perform differential expression analysis
+dds <- DESeq(dds)
+
+# Extract results (Control vs Treated)
+res <- results(dds, contrast=c("Condition", "Treated", "Control"))
+
+# Get summary of results
+summary(res)
+
+# Order results by adjusted p-value
+res_ordered <- res[order(res$padj), ]
+
+# Export results to CSV
+write.csv(as.data.frame(res_ordered), file="results/DESeq2_results.csv")
+
+# Filter for significant differentially expressed genes (DEGs)
+significant_genes <- subset(res_ordered, padj < 0.05 & abs(log2FoldChange) > 1)
+write.csv(as.data.frame(significant_genes), file="results/significant_DEGs.csv")
+
+# Visualize significant results
+plotMA(res, ylim=c(-5, 5), main="MA Plot - DESeq2 Results")
+abline(h=c(-1, 1), col="red", lty=2)
+
+# Volcano plot
+volcano_data <- as.data.frame(res)
+volcano_data$significant <- ifelse(volcano_data$padj < 0.05 & abs(volcano_data$log2FoldChange) > 1, "Yes", "No")
+
+ggplot(volcano_data, aes(x=log2FoldChange, y=-log10(padj), color=significant)) +
+  geom_point(alpha=0.6) +
+  scale_color_manual(values=c("black", "red")) +
+  theme_classic() +
+  geom_vline(xintercept=c(-1, 1), linetype="dashed") +
+  geom_hline(yintercept=-log10(0.05), linetype="dashed") +
+  xlab("Log2 Fold Change") +
+  ylab("-Log10 Adjusted P-value") +
+  ggtitle("Volcano Plot")
+```
+
+### Alternative approach using edgeR
+
+```r
+# Load required libraries
+library(edgeR)
+
+# Create DGEList object
+dge <- DGEList(counts=count_data)
+
+# Define groups based on metadata
+group <- factor(metadata$Condition)
+
+# Calculate normalization factors
+dge <- calcNormFactors(dge)
+
+# Design matrix
+design <- model.matrix(~0+group)
+colnames(design) <- levels(group)
+
+# Estimate dispersion
+dge <- estimateDisp(dge, design)
+
+# Fit model
+fit <- glmQLFit(dge, design)
+
+# Define contrast
+contrast <- makeContrasts(Treated-Control, levels=design)
+
+# Test for differential expression
+qlf <- glmQLFTest(fit, contrast=contrast)
+
+# Extract results
+edgeR_results <- topTags(qlf, n=nrow(dge), sort.by="PValue")
+write.csv(as.data.frame(edgeR_results), file="results/edgeR_results.csv")
+
+# Filter significant genes
+edgeR_significant <- subset(edgeR_results$table, FDR < 0.05 & abs(logFC) > 1)
+write.csv(as.data.frame(edgeR_significant), file="results/edgeR_significant_DEGs.csv")
+```
+
+## 8. Functional Enrichment Analysis
+
+### Gene Ontology (GO) Enrichment using clusterProfiler
+
+```r
+# Load libraries
+library(clusterProfiler)
+library(org.Hs.eg.db)  # For human genes
+library(ggplot2)
+
+# Extract significant gene IDs (assuming Ensembl IDs)
+sig_genes <- rownames(significant_genes)
+
+# Convert Ensembl IDs to Entrez IDs (for human)
+gene_mapping <- bitr(sig_genes, 
+                    fromType="ENSEMBL", 
+                    toType="ENTREZID", 
+                    OrgDb="org.Hs.eg.db")
+
+# Perform GO enrichment analysis
+go_results <- enrichGO(
+  gene = gene_mapping$ENTREZID,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",  # Biological Process
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05
+)
+
+# View results
+head(go_results@result)
+
+# Plot top GO terms
+barplot(go_results, showCategory=15, title="GO Biological Process")
+dotplot(go_results, showCategory=15, title="GO Biological Process")
+
+# Generate enrichment map network
+emapplot(go_results, showCategory=30)
+
+# Export results
+write.csv(go_results@result, file="results/GO_enrichment.csv")
+
+# Repeat for Molecular Function (MF) and Cellular Component (CC)
+go_mf <- enrichGO(gene_mapping$ENTREZID, OrgDb=org.Hs.eg.db, ont="MF", pAdjustMethod="BH", pvalueCutoff=0.05)
+go_cc <- enrichGO(gene_mapping$ENTREZID, OrgDb=org.Hs.eg.db, ont="CC", pAdjustMethod="BH", pvalueCutoff=0.05)
+```
+
+### KEGG Pathway Analysis
+
+```r
+# Perform KEGG pathway enrichment analysis
+kegg_results <- enrichKEGG(
+  gene = gene_mapping$ENTREZID,
+  organism = "hsa",  # Human KEGG code
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+# View results
+head(kegg_results@result)
+
+# Plot pathways
+barplot(kegg_results, showCategory=15, title="KEGG Pathways")
+dotplot(kegg_results, showCategory=15, title="KEGG Pathways")
+
+# Export results
+write.csv(kegg_results@result, file="results/KEGG_enrichment.csv")
+
+# Visualize specific pathway
+library(pathview)
+pathview(gene.data=gene_mapping$ENTREZID, 
+         pathway.id="hsa04010",  # MAPK signaling pathway
+         species="hsa")
+```
+
+## 9. Pathway Analysis
+
+### Gene Set Enrichment Analysis (GSEA) using fgsea
+
+```r
+# Load libraries
+library(fgsea)
+library(msigdbr)
+
+# Get MSigDB gene sets (e.g., Hallmark collection)
+h_gene_sets <- msigdbr(species="Homo sapiens", category="H") %>%
+  dplyr::select(gs_name, entrez_gene) %>%
+  split(x=.$entrez_gene, f=.$gs_name)
+
+# Create ranked gene list (all genes, not just significant ones)
+# First, convert all gene IDs
+all_genes <- rownames(res)
+all_gene_mapping <- bitr(all_genes, 
+                         fromType="ENSEMBL", 
+                         toType="ENTREZID", 
+                         OrgDb="org.Hs.eg.db")
+
+# Create ranked list based on log2FC and padj
+ranked_genes <- res$log2FoldChange
+names(ranked_genes) <- all_genes
+
+# Match to Entrez IDs
+ranked_genes_entrez <- ranked_genes[all_gene_mapping$ENSEMBL]
+names(ranked_genes_entrez) <- all_gene_mapping$ENTREZID
+ranked_genes_entrez <- sort(ranked_genes_entrez, decreasing=TRUE)
+
+# Run GSEA
+gsea_results <- fgsea(
+  pathways = h_gene_sets,
+  stats = ranked_genes_entrez,
+  minSize = 15,
+  maxSize = 500,
+  nperm = 10000
+)
+
+# View and plot results
+gsea_results <- gsea_results[order(gsea_results$pval), ]
+head(gsea_results)
+
+# Plot enrichment scores for top pathways
+top_pathways <- gsea_results$pathway[1:5]  # Top 5 pathways
+for (pathway in top_pathways) {
+  plotEnrichment(h_gene_sets[[pathway]], ranked_genes_entrez) +
+    ggtitle(pathway)
+}
+
+# Export results
+write.csv(gsea_results, file="results/GSEA_results.csv")
+```
+
+## 10. Visualization Techniques
+
+### Advanced visualization with EnhancedVolcano
+
+```r
+# Load library
+library(EnhancedVolcano)
+
+# Create enhanced volcano plot
+EnhancedVolcano(res,
+    lab = rownames(res),
+    x = 'log2FoldChange',
+    y = 'padj',
+    title = 'Treated vs Control',
+    pCutoff = 0.05,
+    FCcutoff = 1,
+    pointSize = 3.0,
+    labSize = 4.0,
+    colAlpha = 0.8,
+    legendPosition = 'right',
+    legendLabSize = 12,
+    legendIconSize = 4.0,
+    drawConnectors = TRUE,
+    widthConnectors = 0.5,
+    colConnectors = 'grey30')
+```
+
+### Heatmap of top differentially expressed genes
+
+```r
+# Get top 50 differentially expressed genes
+top_genes <- rownames(res_ordered)[1:50]
+
+# Extract normalized counts for these genes
+top_gene_counts <- assay(vsd)[top_genes, ]
+
+# Create annotation data frame for heatmap
+anno <- data.frame(
+  Condition = metadata$Condition,
+  Batch = metadata$Batch,
+  row.names = colnames(top_gene_counts)
+)
+
+# Define colors
+anno_colors <- list(
+  Condition = c(Control = "#3CB371", Treated = "#FF6347"),
+  Batch = c("1" = "#6A5ACD", "2" = "#DAA520")
+)
+
+# Create heatmap
+pheatmap(
+  top_gene_counts,
+  scale = "row",
+  annotation_col = anno,
+  annotation_colors = anno_colors,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  fontsize_row = 8,
+  main = "Top 50 Differentially Expressed Genes"
+)
+```
+
+### Gene expression profiles with ggplot2
+
+```r
+# Example: Plot expression of top 5 genes across samples
+top5_genes <- rownames(res_ordered)[1:5]
+gene_data <- as.data.frame(t(assay(vsd)[top5_genes, ]))
+gene_data$Sample <- rownames(gene_data)
+gene_data$Condition <- metadata$Condition[match(gene_data$Sample, rownames(metadata))]
+
+# Reshape data for plotting
+library(reshape2)
+gene_data_long <- melt(gene_data, 
+                       id.vars = c("Sample", "Condition"),
+                       variable.name = "Gene", 
+                       value.name = "Expression")
+
+# Plot
+ggplot(gene_data_long, aes(x = Condition, y = Expression, color = Gene)) +
+  geom_point(position = position_jitter(width = 0.2), size = 3) +
+  geom_line(aes(group = Gene)) +
+  theme_bw() +
+  facet_wrap(~Gene, scales = "free_y") +
+  ggtitle("Expression of Top 5 DEGs")
+```
+
+## 11. Advanced Analyses
+
+### WGCNA for co-expression network analysis
+
+```r
+# Load libraries
+library(WGCNA)
+library(flashClust)
+
+# Set parameters
+options(stringsAsFactors = FALSE)
+enableWGCNAThreads()
+
+# Get expression data from vst transformed counts
+expr_data <- t(assay(vsd))
+
+# Choose soft thresholding power
+powers <- c(1:20)
+sft <- pickSoftThreshold(expr_data, powerVector = powers, verbose = 5)
+
+# Plot results to help choose power
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",
+     ylab="Scale Free Topology Model Fit, signed R^2",
+     main="Scale independence")
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers, cex=0.9, col="red")
+abline(h=0.90, col="red")
+
+# Choose power based on plot (e.g., 6)
+selected_power <- 6
+
+# Construct network
+net <- blockwiseModules(
+  expr_data,
+  power = selected_power,
+  TOMType = "unsigned",
+  minModuleSize = 30,
+  reassignThreshold = 0,
+  mergeCutHeight = 0.25,
+  numericLabels = TRUE,
+  pamRespectsDendro = FALSE,
+  saveTOMs = TRUE,
+  saveTOMFileBase = "TOM",
+  verbose = 3
+)
+
+# Convert labels to colors
+module_colors <- labels2colors(net$colors)
+
+# Plot dendrogram
+plotDendroAndColors(
+  net$dendrograms[[1]],
+  module_colors,
+  "Module colors",
+  dendroLabels = FALSE,
+  hang = 0.03,
+  addGuide = TRUE,
+  guideHang = 0.05
+)
+
+# Relate modules to traits
+# Assuming 'Condition' is a binary trait (0 or 1)
+condition_trait <- as.numeric(metadata$Condition == "Treated")
+names(condition_trait) <- rownames(metadata)
+
+# Calculate module-trait correlations
+module_trait_cor <- cor(net$MEs, condition_trait, use = "p")
+module_trait_pval <- corPvalueStudent(module_trait_cor, nrow(expr_data))
+
+# Create dataframe of results
+module_trait_df <- data.frame(
+  Module = substring(rownames(module_trait_cor), 3),
+  Correlation = module_trait_cor[, 1],
+  PValue = module_trait_pval[, 1]
+)
+
+# Identify significant modules
+sig_modules <- subset(module_trait_df, PValue < 0.05)
+print(sig_modules)
+
+# Extract genes in a significant module (e.g., blue module)
+blue_module_genes <- names(net$colors)[net$colors == which(module_colors == "blue")]
+write.csv(blue_module_genes, file="results/blue_module_genes.csv")
+```
+
+### Alternative splicing analysis using rMATS
+
+First, run rMATS (command line):
+
+```bash
+# Run rMATS for paired-end data
+rmats.py --b1 control_bams.txt \
+  --b2 treated_bams.txt \
+  --gtf annotations.gtf \
+  --od rmats_output/ \
+  --readLength 100 \
+  --nthread 8 \
+  --tstat 8 \
+  -t paired \
+  --libType fr-firststrand
+```
+
+Then analyze in R:
+
+```r
+# Read rMATS results
+se_events <- read.table("rmats_output/SE.MATS.JC.txt", header=TRUE, sep="\t")
+
+# Filter significant events (FDR < 0.05 and |IncLevelDifference| > 0.1)
+sig_se <- subset(se_events, FDR < 0.05 & abs(IncLevelDifference) > 0.1)
+
+# Count significant events
+nrow(sig_se)
+
+# Visualize inclusion level differences
+ggplot(sig_se, aes(x=IncLevelDifference)) +
+  geom_histogram(bins=50, fill="steelblue", color="black") +
+  theme_classic() +
+  xlab("Inclusion Level Difference (Treated - Control)") +
+  ylab("Count") +
+  ggtitle("Distribution of Significant Splicing Changes")
+
+# Export results
+write.csv(sig_se, file="results/significant_splicing_events.csv")
+```
+
+## 12. Reporting and Reproducibility
+
+### Creating an R Markdown report
+
+```r
+# Example R Markdown template
+---
+title: "RNA-Seq Data Analysis Report"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## 1. Introduction
+
+This report presents the analysis of RNA-seq data comparing [Condition A] vs [Condition B].
+
+## 2. Data Processing
+
+```{r load-libraries}
+library(DESeq2)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+```
+
+```{r load-data}
+# Load count data
+counts <- read.table("counts/all_samples_counts.txt", header=TRUE, row.names=1, skip=1)
+counts <- counts[, 6:ncol(counts)]
+colnames(counts) <- c("S1", "S2", "S3", "S4", "S5", "S6")
+
+# Load metadata
+metadata <- read.table("metadata.txt", header=TRUE, row.names=1)
+
+# Create DESeq2 object and perform analysis
+# ...
+```
+
+## 3. Quality Control
+
+```{r qc-plots}
+# PCA plot
+# Sample correlation heatmap
+# ...
+```
+
+## 4. Differential Expression Results
+
+```{r de-analysis}
+# Show DE results
+# Volcano plot
+# ...
+```
+
+## 5. Functional Enrichment Analysis
+
+```{r enrichment}
+# GO results
+# KEGG results
+# ...
+```
+
+## 6. Conclusion
+
+[Summarize key findings]
+
+## 7. Session Info
+
+```{r session-info}
+sessionInfo()
+```
+---
+
+### Using Docker for reproducibility
+
+Example Dockerfile:
+
+```dockerfile
+FROM bioconductor/bioconductor_docker:RELEASE_3_15
+
+# Install required R packages
+RUN R -e "BiocManager::install(c('DESeq2', 'edgeR', 'clusterProfiler', 'ggplot2', \
+                               'pheatmap', 'RColorBrewer', 'EnhancedVolcano', \
+                               'fgsea', 'WGCNA', 'PCAtools'))"
+
+# Install command-line tools
+RUN apt-get update && apt-get install -y \
+    fastqc \
+    trimmomatic \
+    salmon \
+    samtools \
+    subread \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /data
+
+# Command to run when container starts
+CMD ["/bin/bash"]
+```
+
+To build and run:
+
+```bash
+# Build Docker image
+docker build -t rnaseq-pipeline .
+
+# Run container with mounted data
+docker run -v /path/to/local/data:/data -it rnaseq-pipeline
+```
+
+### Using Nextflow for reproducibility and scalability
+
+Example Nextflow script (main.nf):
+
+```nextflow
+#!/usr/bin/env nextflow
+
+// Define parameters
+params.reads = "data/raw/*_{1,2}.fastq.gz"
+params.genome = "data/reference/genome.fa"
+params.gtf = "data/reference/annotations.gtf"
+params.outdir = "results"
+
+// Define channels
+Channel
+    .fromFilePairs(params.reads, checkIfExists: true)
+    .set { read_pairs_ch }
+
+// FastQC
+process fastqc {
+    publishDir "${params.outdir}/fastqc", mode: 'copy'
+    
+    input:
+    tuple val(sample_id), path(reads) from read_pairs_ch
+    
+    output:
+    path "*_fastqc.{zip,html}" into fastqc_results
+    
+    script:
+    """
+    fastqc -q $reads
+    """
+}
+
+// Trimming
+process trimmomatic {
+    publishDir "${params.outdir}/trimmed", mode: 'copy'
+    
+    input:
+    tuple val(sample_id), path(reads) from read_pairs_ch
+    
+    output:
+    tuple val(sample_id), path("${sample_id}_trimmed_{1,2}.fastq.gz") into trimmed_reads
+    
+    script:
+    """
+    trimmomatic PE -threads $task.cpus \
+        ${reads[0]} ${reads[1]} \
+        ${sample_id}_trimmed_1.fastq.gz ${sample_id}_unpaired_1.fastq.gz \
+        ${sample_id}_trimmed_2.fastq.gz ${sample_id}_unpaired_2.fastq.gz \
+        ILLUMINACLIP:TruSeq3-PE.fa:2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36
+    """
+}
+
+// STAR index
+process star_index {
+    publishDir "${params.outdir}/star_index", mode: 'copy'
+    
+    input:
+    path genome from file(params.genome)
+    path gtf from file(params.gtf)
+    
+    output:
+    path "star_index" into star_index_ch
+    
+    script:
+    """
+    mkdir -p star_index
+    STAR --runMode genomeGenerate \
+        --genomeDir star_index \
+        --genomeFastaFiles $genome \
+        --sjdbGTFfile $gtf \
+        --sjdbOverhang 99 \
+        --runThreadN $task.cpus
+    """
+}
+
+// STAR alignment
+process star_align {
+    publishDir "${params.outdir}/aligned", mode: 'copy'
+    
+    input:
+    tuple val(sample_id), path(reads) from trimmed_reads
+    path star_index from star_index_ch
+    
+    output:
+    tuple val(sample_id), path("${sample_id}Aligned.sortedByCoord.out.bam") into aligned_bams
+    path "${sample_id}*" into star_logs
+    
+    script:
+    """
+    STAR --genomeDir $star_index \
+        --readFilesIn $reads \
+        --readFilesCommand zcat \
+        --outFileNamePrefix ${sample_id} \
+        --outSAMtype BAM SortedByCoordinate \
+        --outSAMunmapped Within \
+        --quantMode GeneCounts \
+        --runThreadN $task.cpus
+    """
+}
+
+// featureCounts
+process featureCounts {
+    publishDir "${params.outdir}/counts", mode: 'copy'
+    
+    input:
+    path gtf from file(params.gtf)
+    path bams from aligned_bams.collect{ it[1] }
+    
+    output:
+    path "counts.txt" into count_matrix
+    
+    script:
+    """
+    featureCounts -p -T $task.cpus \
+        -a $gtf \
+        -o counts.txt \
+        $bams
+    """
+}
+
+// Run R analysis
+process deseq2_analysis {
+    publishDir "${params.outdir}/deseq2", mode: 'copy'
+    
+    input:
+    path counts from count_matrix
+    path metadata from file("metadata.txt")
+    
+    output:
+    path "deseq2_results.csv"
+    path "*.pdf"
+    
+    script:
+    """
+    #!/usr/bin/env Rscript
+    
+    library(DESeq2)
+    library(ggplot2)
+    library(pheatmap)
+    
+    # Load data
+    count_data <- read.table("$counts", header=TRUE, row.names=1, skip=1)
+    count_data <- count_data[, 6:ncol(count_data)]
+    
+    metadata <- read.table("$metadata", header=TRUE, row.names=1)
+    
+    # Check alignment
+    all(colnames(count_data) == rownames(metadata))
+    
+    # DESeq2 analysis
+    dds <- DESeqDataSetFromMatrix(
+        countData = count_data,
+        colData = metadata,
+        design = ~ Condition
+    )
+    
+    dds <- DESeq(dds)
+    res <- results(dds, contrast=c("Condition", "Treated", "Control"))
+    
+    # Export results
+    write.csv(as.data.frame(res[order(res\$padj),]), file="deseq2_results.csv")
+    
+    # Create PCA plot
+    vsd <- vst(dds, blind=FALSE)
+    pdf("pca_plot.pdf")
+    plotPCA(vsd, intgroup=c("Condition", "Batch"))
+    dev.off()
+    
+    # Create heatmap
+    pdf("sample_heatmap.pdf")
+    sampleDists <- dist(t(assay(vsd)))
+    sampleDistMatrix <- as.matrix(sampleDists)
+    pheatmap(sampleDistMatrix)
+    dev.off()
+    
+    # MA plot
+    pdf("ma_plot.pdf")
+    plotMA(res, ylim=c(-5,5))
+    dev.off()
+    """
+}
+
+// Workflow completion notification
+workflow.onComplete {
+    log.info "Pipeline completed at: $workflow.complete"
+    log.info "Execution status: ${ workflow.success ? 'Succeeded' : 'Failed' }"
+    log.info "Execution duration: $workflow.duration"
+}
+```
+
+Run with:
+
+```bash
+nextflow run main.nf -profile docker
+```
+
+## References
+
+1. Love MI, Huber W, Anders S. Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2. Genome Biology. 2014;15(12):550.
+2. Dobin A, Davis CA, Schlesinger F, et al. STAR: ultrafast universal RNA-seq aligner. Bioinformatics. 2013;29(1):15-21.
+3. Robinson MD, McCarthy DJ, Smyth GK. edgeR: a Bioconductor package for differential expression analysis of digital gene expression data. Bioinformatics. 2010;26(1):139-140.
+4. Yu G, Wang LG, Han Y, He QY. clusterProfiler: an R package for comparing biological themes among gene clusters. OMICS. 2012;16(5):284-287.
+5. Langfelder P, Horvath S. WGCNA: an R package for weighted correlation network analysis. BMC Bioinformatics. 2008;9:559.
+6. Shen S, Park JW, Lu ZX, et al. rMATS: robust and flexible detection of differential alternative splicing from replicate RNA-Seq data. PNAS. 2014;111(51):E5593-5601.
